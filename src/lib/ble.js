@@ -1,229 +1,281 @@
+import * as protocol from './protocol.js';
 
-// Pybricks Bluetooth LE logic
-export const PYBRICKS_SERVICE_UUID = 'c5f50001-8280-46da-89f4-6d8051e4aeef';
-export const PYBRICKS_CONTROL_CHARACTERISTIC_UUID = 'c5f50002-8280-46da-89f4-6d8051e4aeef';
-export const PYBRICKS_HUB_CAPABILITIES_CHARACTERISTIC_UUID = 'c5f50003-8280-46da-89f4-6d8051e4aeef';
+// Re-export protocol for consumers
+export * from './protocol.js';
 
-// Event Types
-export const EVENT_STATUS_REPORT = 0;
-export const EVENT_WRITE_STDOUT = 1;
-export const EVENT_WRITE_APP_DATA = 2;
+let transport = null;
+let relaySocket = null;
+let onStatusChangeCallback = null;
+let onDataReceivedCallback = null;
+let onErrorCallback = null;
 
-// Command Types
-export const COMMAND_STOP_USER_PROGRAM = 0;
-export const COMMAND_START_USER_PROGRAM = 1;
-export const COMMAND_START_REPL = 2; // Legacy/Built-in
-export const COMMAND_WRITE_USER_PROGRAM_META = 3;
-export const COMMAND_WRITE_USER_RAM = 4;
-export const COMMAND_RESET_IN_UPDATE_MODE = 5;
-export const COMMAND_WRITE_STDIN = 6;
-export const COMMAND_WRITE_APP_DATA = 7;
+// Capabilities state
+let maxWriteSize = 100; // Default safe value
+let capabilitiesCharacteristic = null; // Specific to BLE transport
 
-// Status Flags
-export const STATUS_BATTERY_LOW_VOLTAGE_WARNING = 0;
-export const STATUS_BATTERY_LOW_VOLTAGE_SHUTDOWN = 1;
-export const STATUS_BATTERY_HIGH_CURRENT = 2;
-export const STATUS_BLE_ADVERTISING = 3;
-export const STATUS_BLE_LOW_SIGNAL = 4;
-export const STATUS_POWER_BUTTON_PRESSED = 5;
-export const STATUS_USER_PROGRAM_RUNNING = 6;
-export const STATUS_SHUTDOWN = 7;
+// --- Transports ---
 
-// Hub Capabilities Flags
-export const HUB_CAPABILITY_HAS_REPL = 1 << 0;
-export const HUB_CAPABILITY_USER_PROGRAM_MULTI_MPY6 = 1 << 1;
-export const HUB_CAPABILITY_USER_PROGRAM_MULTI_MPY6_NATIVE6P1 = 1 << 2;
-export const HUB_CAPABILITY_HAS_PORT_VIEW = 1 << 3;
-export const HUB_CAPABILITY_HAS_IMU_CALIBRATION = 1 << 4;
+class BLETransport {
+    constructor() {
+        this.device = null;
+        this.server = null;
+        this.service = null;
+        this.characteristic = null;
+    }
 
-// Built-in Program IDs
-export const BUILTIN_PROGRAM_REPL = 0x80;
-export const BUILTIN_PROGRAM_PORT_VIEW = 0x81;
-export const BUILTIN_PROGRAM_IMU_CALIBRATION = 0x82;
-
-let device;
-let server;
-let service;
-let characteristic;
-let capabilitiesCharacteristic;
-
-export async function connect(onStatusChange, onDataReceived, onError) {
-    try {
+    async connect() {
         if (!navigator.bluetooth) {
-            throw new Error('Web Bluetooth is not supported in this browser.');
+            throw new Error('Web Bluetooth is not supported.');
         }
 
-        onStatusChange('Requesting device...');
-        device = await navigator.bluetooth.requestDevice({
-            filters: [{ services: [PYBRICKS_SERVICE_UUID] }],
-            optionalServices: [PYBRICKS_SERVICE_UUID]
+        onStatusChangeCallback('Requesting device...');
+        this.device = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [protocol.PYBRICKS_SERVICE_UUID] }],
+            optionalServices: [protocol.PYBRICKS_SERVICE_UUID]
         });
 
-        device.addEventListener('gattserverdisconnected', () => {
-            onStatusChange('Disconnected');
+        this.device.addEventListener('gattserverdisconnected', () => {
+            onStatusChangeCallback('Disconnected');
+            transport = null;
         });
 
-        onStatusChange('Connecting to GATT Server...');
-        server = await device.gatt.connect();
+        onStatusChangeCallback('Connecting to GATT Server...');
+        this.server = await this.device.gatt.connect();
 
-        onStatusChange('Getting Primary Service...');
-        service = await server.getPrimaryService(PYBRICKS_SERVICE_UUID);
+        onStatusChangeCallback('Getting Primary Service...');
+        this.service = await this.server.getPrimaryService(protocol.PYBRICKS_SERVICE_UUID);
 
-        onStatusChange('Getting Characteristics...');
-        characteristic = await service.getCharacteristic(PYBRICKS_CONTROL_CHARACTERISTIC_UUID);
+        onStatusChangeCallback('Getting Characteristics...');
+        this.characteristic = await this.service.getCharacteristic(protocol.PYBRICKS_CONTROL_CHARACTERISTIC_UUID);
         
+        // Try getting capabilities char
         try {
-            capabilitiesCharacteristic = await service.getCharacteristic(PYBRICKS_HUB_CAPABILITIES_CHARACTERISTIC_UUID);
+            capabilitiesCharacteristic = await this.service.getCharacteristic(protocol.PYBRICKS_HUB_CAPABILITIES_CHARACTERISTIC_UUID);
         } catch (e) {
             console.warn('Capabilities characteristic not found', e);
+            capabilitiesCharacteristic = null;
         }
 
-        onStatusChange('Starting Notifications...');
-        await characteristic.startNotifications();
+        onStatusChangeCallback('Starting Notifications...');
+        await this.characteristic.startNotifications();
 
-        characteristic.addEventListener('characteristicvaluechanged', (event) => {
+        this.characteristic.addEventListener('characteristicvaluechanged', (event) => {
             const value = event.target.value;
             const data = new Uint8Array(value.buffer);
-            onDataReceived(data);
+            handleDataReceived(data);
         });
 
-        onStatusChange('Connected');
         return true;
+    }
 
-    } catch (error) {
-        console.error('Connection failed', error);
-        onError(error.message);
-        return false;
+    async write(data) {
+        if (!this.characteristic) throw new Error('Not connected');
+        await this.characteristic.writeValueWithResponse(data);
+    }
+
+    async readCapabilities() {
+        if (!capabilitiesCharacteristic) return null;
+        return await capabilitiesCharacteristic.readValue();
+    }
+
+    disconnect() {
+        if (this.device && this.device.gatt.connected) {
+            this.device.gatt.disconnect();
+        }
     }
 }
 
-export async function readCapabilities() {
-    if (!capabilitiesCharacteristic) return 0;
-    const value = await capabilitiesCharacteristic.readValue();
-    let flags = 0;
-    // Handle different sizes of capabilities flags (up to 32 bits potentially, though usually small)
-    if (value.byteLength === 1) flags = value.getUint8(0);
-    else if (value.byteLength === 2) flags = value.getUint16(0, true);
-    else if (value.byteLength === 4) flags = value.getUint32(0, true);
-    return flags;
+class WebSocketTransport {
+    constructor(url) {
+        this.url = url;
+        this.ws = null;
+    }
+
+    async connect() {
+        return new Promise((resolve, reject) => {
+            onStatusChangeCallback('Connecting to Socket...');
+            this.ws = new WebSocket(this.url);
+            this.ws.binaryType = 'arraybuffer';
+
+            this.ws.onopen = () => {
+                onStatusChangeCallback('Connected (Virtual)');
+                resolve(true);
+            };
+
+            this.ws.onmessage = (event) => {
+                // Incoming data from "Virtual Hub"
+                if (event.data instanceof ArrayBuffer) {
+                    handleDataReceived(new Uint8Array(event.data));
+                } else if (typeof event.data === 'string') {
+                    // Maybe JSON command? For now assume raw data is binary
+                    try {
+                        const json = JSON.parse(event.data);
+                        if (json.type === 'data') {
+                            // Base64 or array?
+                            // handleDataReceived(...) 
+                        }
+                    } catch(e) {}
+                }
+            };
+
+            this.ws.onclose = () => {
+                onStatusChangeCallback('Disconnected');
+                transport = null;
+            };
+
+            this.ws.onerror = (e) => {
+                onErrorCallback('WebSocket Error');
+                reject(e);
+            };
+        });
+    }
+
+    async write(data) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(data);
+        } else {
+            throw new Error('Socket not connected');
+        }
+    }
+
+    async readCapabilities() {
+        // Virtual hub capabilities?
+        // We could simulate them or ask the remote.
+        // For now return null (defaults)
+        return null; 
+    }
+
+    disconnect() {
+        if (this.ws) this.ws.close();
+    }
 }
 
-export function parseCapabilities(flags) {
-    return {
-        hasRepl: !!(flags & HUB_CAPABILITY_HAS_REPL),
-        userProgramMultiMpy6: !!(flags & HUB_CAPABILITY_USER_PROGRAM_MULTI_MPY6),
-        userProgramMultiMpy6Native6p1: !!(flags & HUB_CAPABILITY_USER_PROGRAM_MULTI_MPY6_NATIVE6P1),
-        hasPortView: !!(flags & HUB_CAPABILITY_HAS_PORT_VIEW),
-        hasImuCalibration: !!(flags & HUB_CAPABILITY_HAS_IMU_CALIBRATION)
-    };
+// --- Core Logic ---
+
+function handleDataReceived(data) {
+    // 1. Update UI
+    if (onDataReceivedCallback) onDataReceivedCallback(data);
+
+    // 2. Relay to Socket if enabled
+    if (relaySocket && relaySocket.readyState === WebSocket.OPEN) {
+        relaySocket.send(data);
+    }
+}
+
+export async function connect(onStatusChange, onDataReceived, onError) {
+    onStatusChangeCallback = onStatusChange;
+    onDataReceivedCallback = onDataReceived;
+    onErrorCallback = onError;
+
+    transport = new BLETransport();
+    const success = await transport.connect();
+    if (success) onStatusChange('Connected');
+    return success;
+}
+
+export async function connectVirtual(url, onStatusChange, onDataReceived, onError) {
+    onStatusChangeCallback = onStatusChange;
+    onDataReceivedCallback = onDataReceived;
+    onErrorCallback = onError;
+
+    transport = new WebSocketTransport(url);
+    const success = await transport.connect();
+    // transport.connect calls onStatusChange
+    return success;
+}
+
+export function setRelay(ws) {
+    relaySocket = ws;
+    if (relaySocket) {
+        // Also listen for commands from relay socket to send to Hub
+        relaySocket.addEventListener('message', async (event) => {
+            if (transport && event.data instanceof ArrayBuffer) {
+                // Received binary command from relay -> Forward to Hub
+                try {
+                    await transport.write(new Uint8Array(event.data));
+                } catch (e) {
+                    console.error('Failed to relay command to hub', e);
+                }
+            } else if (transport && typeof event.data === 'string') {
+                 // Maybe a JSON command wrapper?
+            }
+        });
+    }
 }
 
 export function disconnect() {
-    if (device && device.gatt.connected) {
-        device.gatt.disconnect();
-    }
+    if (transport) transport.disconnect();
 }
 
+export async function readCapabilities() {
+    if (!transport) return { flags: 0 };
+    
+    const value = await transport.readCapabilities();
+    
+    if (value && value.byteLength >= 6) {
+        maxWriteSize = value.getUint16(0, true);
+        const flags = value.getUint32(2, true);
+        const maxUserProgramSize = value.getUint32(6, true);
+        console.log(`Hub Capabilities: MaxWrite=${maxWriteSize}, Flags=${flags.toString(16)}`);
+        return { flags, maxUserProgramSize };
+    }
+    
+    return { flags: 0 };
+}
+
+// Generic Send Helper
 export async function sendCommand(commandCode, payload = []) {
-    if (!characteristic) {
-        throw new Error('Not connected');
-    }
+    if (!transport) throw new Error('Not connected');
     const data = new Uint8Array([commandCode, ...payload]);
-    await characteristic.writeValueWithResponse(data);
+    await transport.write(data);
 }
 
-// Higher level command helpers
+// --- Higher Level Commands (Using protocol helpers) ---
+
 export async function stopUserProgram() {
-    await sendCommand(COMMAND_STOP_USER_PROGRAM); 
+    if (!transport) return;
+    await transport.write(protocol.createStopUserProgramCommand());
 }
 
 export async function startUserProgram(slot = 0) {
-    await sendCommand(COMMAND_START_USER_PROGRAM, [slot]);
+    if (!transport) return;
+    await transport.write(protocol.createStartUserProgramCommand(slot));
 }
 
 export async function startRepl() {
-    await sendCommand(COMMAND_START_USER_PROGRAM, [BUILTIN_PROGRAM_REPL]);
+    await startUserProgram(protocol.BUILTIN_PROGRAM_REPL);
 }
 
 export async function startPortView() {
-    await sendCommand(COMMAND_START_USER_PROGRAM, [BUILTIN_PROGRAM_PORT_VIEW]);
+    await startUserProgram(protocol.BUILTIN_PROGRAM_PORT_VIEW);
 }
 
 export async function startImuCalibration() {
-    await sendCommand(COMMAND_START_USER_PROGRAM, [BUILTIN_PROGRAM_IMU_CALIBRATION]);
+    await startUserProgram(protocol.BUILTIN_PROGRAM_IMU_CALIBRATION);
 }
 
 export async function writeStdin(text) {
-    const encoder = new TextEncoder();
-    const payload = encoder.encode(text);
-    await sendCommand(COMMAND_WRITE_STDIN, payload);
+    if (!transport) return;
+    await transport.write(protocol.createWriteStdinCommand(text));
 }
 
 export async function writeAppData(offset, payload) {
-    const buffer = new ArrayBuffer(2 + payload.byteLength);
-    const view = new DataView(buffer);
-    view.setUint16(0, offset, true);
-    new Uint8Array(buffer).set(new Uint8Array(payload), 2);
-    await sendCommand(COMMAND_WRITE_APP_DATA, new Uint8Array(buffer));
+    if (!transport) return;
+    await transport.write(protocol.createWriteAppDataCommand(offset, payload));
 }
 
 export async function resetInUpdateMode() {
-    await sendCommand(COMMAND_RESET_IN_UPDATE_MODE);
-}
-
-export function parseStatusReport(payload) {
-    // payload is a DataView starting at the flag bytes (offset 1 from the original event msg)
-    // Wait, the caller passes the full payload or just the slice?
-    // In App.svelte: 
-    // const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-    // flags = parseStatusFlags(view.getUint32(0, true));
-    
-    // Let's refactor App.svelte to use this function properly or update this to accept the view.
-    // But for now, let's keep the signature compatible or return an object.
-    
-    // We'll assume the caller passes the DataView of the payload (excluding the event type byte if done in App.svelte, 
-    // BUT App.svelte does: `const payload = data.slice(1); ... view.getUint32(0, true)`
-    
-    // So here we receive the flags integer? No, let's change `parseStatusFlags` to `parseStatusReport` in App.svelte too.
-    return {};
-}
-
-// Helper to decode flags integer
-export function decodeStatusFlags(flags) {
-    return {
-        batteryLowVoltageWarning: !!(flags & (1 << STATUS_BATTERY_LOW_VOLTAGE_WARNING)),
-        batteryLowVoltageShutdown: !!(flags & (1 << STATUS_BATTERY_LOW_VOLTAGE_SHUTDOWN)),
-        batteryHighCurrent: !!(flags & (1 << STATUS_BATTERY_HIGH_CURRENT)),
-        bleAdvertising: !!(flags & (1 << STATUS_BLE_ADVERTISING)),
-        bleLowSignal: !!(flags & (1 << STATUS_BLE_LOW_SIGNAL)),
-        powerButtonPressed: !!(flags & (1 << STATUS_POWER_BUTTON_PRESSED)),
-        userProgramRunning: !!(flags & (1 << STATUS_USER_PROGRAM_RUNNING)),
-        shutdown: !!(flags & (1 << STATUS_SHUTDOWN))
-    };
-}
-
-function createWriteUserProgramMetaCommand(size) {
-    const buffer = new ArrayBuffer(5);
-    const view = new DataView(buffer);
-    view.setUint8(0, COMMAND_WRITE_USER_PROGRAM_META);
-    view.setUint32(1, size, true);
-    return new Uint8Array(buffer);
-}
-
-function createWriteUserRamCommand(offset, payload) {
-    const buffer = new ArrayBuffer(5 + payload.byteLength);
-    const view = new DataView(buffer);
-    view.setUint8(0, COMMAND_WRITE_USER_RAM);
-    view.setUint32(1, offset, true);
-    const uint8Payload = new Uint8Array(payload);
-    new Uint8Array(buffer).set(uint8Payload, 5);
-    return new Uint8Array(buffer);
+    if (!transport) return;
+    await transport.write(protocol.createResetInUpdateModeCommand());
 }
 
 let lastUploadedBinary = null;
 
 export async function uploadProgram(fileData, onProgress) {
-    if (!characteristic) throw new Error('Not connected');
+    if (!transport) throw new Error('Not connected');
+
+    // Use negotiated chunk size minus command overhead (5 bytes)
+    const CHUNK_SIZE = Math.max(20, maxWriteSize - 5);
 
     // 1. Find where the new program differs from the old one
     let startIndex = 0;
@@ -243,26 +295,24 @@ export async function uploadProgram(fileData, onProgress) {
             return;
         }
 
-        // Align start index to chunk size boundary downwards to be safe/simple
-        const CHUNK_SIZE = 100;
+        // Align start index to chunk size boundary downwards
         startIndex = Math.floor(diffIndex / CHUNK_SIZE) * CHUNK_SIZE;
         console.log(`Incremental upload starting at offset ${startIndex} (diff at ${diffIndex})`);
     }
 
-    const metaCmd0 = createWriteUserProgramMetaCommand(0);
-    await characteristic.writeValueWithResponse(metaCmd0);
+    const metaCmd0 = protocol.createWriteUserProgramMetaCommand(0);
+    await transport.write(metaCmd0);
 
-    const CHUNK_SIZE = 100; 
     // Start from the calculated offset
     for (let i = startIndex; i < fileData.byteLength; i += CHUNK_SIZE) {
         const chunk = fileData.slice(i, i + CHUNK_SIZE);
-        const ramCmd = createWriteUserRamCommand(i, chunk);
-        await characteristic.writeValueWithResponse(ramCmd);
+        const ramCmd = protocol.createWriteUserRamCommand(i, chunk);
+        await transport.write(ramCmd);
         if (onProgress) onProgress((i + chunk.byteLength) / fileData.byteLength);
     }
 
-    const metaCmdFinal = createWriteUserProgramMetaCommand(fileData.byteLength);
-    await characteristic.writeValueWithResponse(metaCmdFinal);
+    const metaCmdFinal = protocol.createWriteUserProgramMetaCommand(fileData.byteLength);
+    await transport.write(metaCmdFinal);
     
     // Store for next time (clone it to be safe)
     lastUploadedBinary = new Uint8Array(fileData);

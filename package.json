@@ -17,6 +17,7 @@
   "dependencies": {
     "@pybricks/mpy-cross-v6": "^2.0.0",
     "monaco-editor": "^0.55.1",
+    "pocketbase": "^0.26.8",
     "pyodide": "^0.29.3"
   }
 }

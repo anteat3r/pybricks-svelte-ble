@@ -1,6 +1,6 @@
 <script>
   import { 
-    connect, disconnect, stopUserProgram, uploadProgram, decodeStatusFlags,
+    connect, connectVirtual, setRelay, disconnect, stopUserProgram, uploadProgram, decodeStatusFlags,
     readCapabilities, parseCapabilities,
     startUserProgram, startRepl, startPortView, startImuCalibration,
     writeStdin, writeAppData, resetInUpdateMode,
@@ -9,6 +9,7 @@
   import { compile } from './lib/compiler';
   import * as storage from './lib/storage';
   import Editor from './lib/Editor.svelte';
+  import pb from './lib/pocketbase';
 
   let status = $state('Disconnected');
   let logs = $state([]);
@@ -18,6 +19,96 @@
   let uploadProgress = $state(0);
   let isUploading = $state(false);
   
+  // Auth State
+  let currentUser = $state(pb.authStore.model);
+  let showLogin = $state(false);
+  let loginEmail = $state('');
+  let loginPassword = $state('');
+  let loginCollection = $state('robots');
+  let ws = null;
+  let useVirtualMode = $state(false);
+  let streamEnabled = $state(true); // Default to streaming if logged in
+
+  async function handleLogin() {
+      try {
+          await pb.collection(loginCollection).authWithPassword(loginEmail, loginPassword);
+          currentUser = pb.authStore.model;
+          showLogin = false;
+          addLog(`Logged in as ${currentUser.email || currentUser.name || currentUser.id}`);
+          if (!useVirtualMode && streamEnabled) connectToStream();
+      } catch (e) {
+          alert('Login failed: ' + e.message);
+      }
+  }
+
+  function handleLogout() {
+      pb.authStore.clear();
+      currentUser = null;
+      if (ws) {
+          ws.close();
+          ws = null;
+          addLog("WebSocket closed.");
+      }
+      setRelay(null);
+  }
+
+  function connectToStream() {
+      if (!pb.authStore.isValid) return;
+      
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = 'localhost:8090'; // Assuming local backend
+      const url = `${protocol}//${host}/api/robot-stream?token=${pb.authStore.token}&robot_id=${currentUser.id}`;
+      
+      addLog(`Connecting to stream...`);
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      
+      ws.onopen = () => {
+          addLog("Stream Connected!");
+          ws.send(JSON.stringify({ type: 'hello', id: currentUser.id }));
+          setRelay(ws); // Enable relaying BLE events to this socket
+      };
+      
+      ws.onmessage = (evt) => {
+          // In relay mode, we might receive commands to forward to BLE
+          // This is handled by ble.js setRelay listener mostly for binary data.
+          // Text data log:
+          if (typeof evt.data === 'string') addLog(`Stream RX: ${evt.data}`);
+      };
+      
+      ws.onclose = () => {
+          addLog("Stream Disconnected");
+          ws = null;
+          setRelay(null);
+      };
+      
+      ws.onerror = (e) => {
+          addLog("Stream Error");
+          console.error(e);
+      };
+  }
+
+  async function handleConnect() {
+      if (useVirtualMode) {
+          if (!pb.authStore.isValid) {
+              alert('Please login first for Virtual Mode');
+              showLogin = true;
+              return;
+          }
+          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const host = 'localhost:8090'; 
+          const url = `${protocol}//${host}/api/robot-stream?token=${pb.authStore.token}&robot_id=${currentUser.id}`;
+          
+          await connectVirtual(url, handleStatusChange, handleDataReceived, e => addLog(e));
+      } else {
+          await connect(handleStatusChange, handleDataReceived, e => addLog(e));
+          // If logged in and not virtual, connect stream relay
+          if (pb.authStore.isValid && streamEnabled && !ws) {
+              connectToStream();
+          }
+      }
+  }
+
   // File System State
   let files = $state(storage.getFiles());
   let activeFileId = $state(null);
@@ -215,8 +306,19 @@
       {/if}
     </div>
     <div class="nav-actions">
+        {#if currentUser}
+            <span class="user-label">{currentUser.email || currentUser.name}</span>
+            <label class="mode-toggle">
+                <input type="checkbox" bind:checked={useVirtualMode}> Virtual
+            </label>
+            <button class="secondary small" onclick={handleLogout}>Logout</button>
+        {:else}
+            <button class="primary small" onclick={() => showLogin = true}>Login</button>
+        {/if}
         {#if !isConnected}
-            <button class="primary" onclick={() => connect(handleStatusChange, handleDataReceived, e => addLog(e))}>Connect Hub</button>
+            <button class="primary" onclick={handleConnect}>
+                {useVirtualMode ? 'Connect Socket' : 'Connect Hub'}
+            </button>
         {:else}
             <button class="danger" onclick={stopUserProgram}>STOP</button>
             <button class="secondary" onclick={disconnect}>Disconnect</button>
@@ -401,6 +503,26 @@
         {/if}
     </div>
   </footer>
+
+  {#if showLogin}
+    <div class="modal-overlay">
+        <div class="modal">
+            <h3>Login (Robot)</h3>
+            <div class="form-group">
+                <label>Identity (Email/Name)</label>
+                <input type="text" bind:value={loginEmail} placeholder="Email or Name">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" bind:value={loginPassword} placeholder="Password">
+            </div>
+            <div class="modal-actions">
+                <button class="secondary" onclick={() => showLogin = false}>Cancel</button>
+                <button class="primary" onclick={handleLogin}>Login</button>
+            </div>
+        </div>
+    </div>
+  {/if}
 </main>
 
 <style>
@@ -521,4 +643,22 @@
 
   .clear-btn { opacity: 0.5; font-size: 10px; }
   .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; opacity: 0.3; }
+
+  /* Auth UI */
+  .user-label { font-size: 11px; margin-right: 8px; color: #888; }
+  .mode-toggle { font-size: 11px; margin-right: 8px; color: #ccc; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+  
+  .modal-overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;
+  }
+  .modal {
+      background: var(--bg-panel); border: 1px solid var(--border); padding: 20px; width: 300px;
+      display: flex; flex-direction: column; gap: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+  }
+  .modal h3 { margin: 0; color: var(--text-bright); }
+  .form-group { display: flex; flex-direction: column; gap: 5px; }
+  .form-group label { font-size: 11px; color: #888; }
+  .form-group select { background: #3c3c3c; border: 1px solid #444; color: white; padding: 4px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 </style>
