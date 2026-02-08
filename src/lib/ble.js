@@ -220,14 +220,41 @@ function createWriteUserRamCommand(offset, payload) {
     return new Uint8Array(buffer);
 }
 
+let lastUploadedBinary = null;
+
 export async function uploadProgram(fileData, onProgress) {
     if (!characteristic) throw new Error('Not connected');
+
+    // 1. Find where the new program differs from the old one
+    let startIndex = 0;
+    if (lastUploadedBinary) {
+        // Compare buffers
+        const minLen = Math.min(fileData.byteLength, lastUploadedBinary.byteLength);
+        let diffIndex = 0;
+        while (diffIndex < minLen && fileData[diffIndex] === lastUploadedBinary[diffIndex]) {
+            diffIndex++;
+        }
+
+        // If identical and size is same, no upload needed (but we restart)
+        if (diffIndex === minLen && fileData.byteLength === lastUploadedBinary.byteLength) {
+            console.log('Program identical, skipping upload.');
+            await startUserProgram(0);
+            if (onProgress) onProgress(1);
+            return;
+        }
+
+        // Align start index to chunk size boundary downwards to be safe/simple
+        const CHUNK_SIZE = 100;
+        startIndex = Math.floor(diffIndex / CHUNK_SIZE) * CHUNK_SIZE;
+        console.log(`Incremental upload starting at offset ${startIndex} (diff at ${diffIndex})`);
+    }
 
     const metaCmd0 = createWriteUserProgramMetaCommand(0);
     await characteristic.writeValueWithResponse(metaCmd0);
 
     const CHUNK_SIZE = 100; 
-    for (let i = 0; i < fileData.byteLength; i += CHUNK_SIZE) {
+    // Start from the calculated offset
+    for (let i = startIndex; i < fileData.byteLength; i += CHUNK_SIZE) {
         const chunk = fileData.slice(i, i + CHUNK_SIZE);
         const ramCmd = createWriteUserRamCommand(i, chunk);
         await characteristic.writeValueWithResponse(ramCmd);
@@ -236,5 +263,9 @@ export async function uploadProgram(fileData, onProgress) {
 
     const metaCmdFinal = createWriteUserProgramMetaCommand(fileData.byteLength);
     await characteristic.writeValueWithResponse(metaCmdFinal);
+    
+    // Store for next time (clone it to be safe)
+    lastUploadedBinary = new Uint8Array(fileData);
+    
     await startUserProgram(0);
 }

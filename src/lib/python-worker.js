@@ -1,4 +1,3 @@
-
 import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.mjs";
 import { 
     MSG_INIT, MSG_INIT_COMPLETE, MSG_INIT_FAIL,
@@ -7,7 +6,6 @@ import {
 } from './python-message.js';
 
 let pyodide = null;
-let script = null; // Jedi script object
 
 const pybricksStubs = `
 # Basic Pybricks Stubs for Autocompletion
@@ -234,44 +232,13 @@ async function setupEnvironment() {
     pyodide.FS.writeFile('/pybricks/__init__.py', '');
     
     // 2. Create submodules
-    const modules = {
-        'hubs.py': ['Hub', 'PrimeHub', 'InventorHub', 'EssentialHub', 'TechnicHub', 'CityHub', 'MoveHub', 'EV3Brick'],
-        'pupdevices.py': ['Motor', 'DCMotor', 'ColorSensor', 'UltrasonicSensor', 'ForceSensor'],
-        'ev3devices.py': ['Motor', 'ColorSensor', 'UltrasonicSensor'], // Simplified overlap
-        'parameters.py': ['Port', 'Direction', 'Stop', 'Color', 'Button', 'Side'],
-        'tools.py': ['wait', 'StopWatch'],
-        'robotics.py': ['DriveBase']
-    };
-
-    // We'll just write the big stub file to all of them for simplicity, 
-    // or splitting them would be better but the big file covers most "import *" cases if we are lazy.
-    // Better: write the big file as a common base, then import from it.
-    
-    // Actually, let's just write the stub content to each file properly if we can,
-    // or just put everything in pybricks.py and rely on Jedi finding it?
-    // Jedi resolves imports.
-    
-    // Simplest approach: Write specific stub files mapping to the classes.
-    
-    // Write the big stubs to a hidden file
     pyodide.FS.writeFile('/_pybricks_stubs.py', pybricksStubs);
 
-    // pybricks/hubs.py
     pyodide.FS.writeFile('/pybricks/hubs.py', 'from _pybricks_stubs import Hub, PrimeHub, InventorHub, EssentialHub, TechnicHub, CityHub, MoveHub, EV3Brick');
-    
-    // pybricks/pupdevices.py
     pyodide.FS.writeFile('/pybricks/pupdevices.py', 'from _pybricks_stubs import Motor, DCMotor, ColorSensor, UltrasonicSensor, ForceSensor, ColorLight');
-    
-    // pybricks/parameters.py
     pyodide.FS.writeFile('/pybricks/parameters.py', 'from _pybricks_stubs import Port, Direction, Stop, Color, Button, Side');
-    
-    // pybricks/tools.py
     pyodide.FS.writeFile('/pybricks/tools.py', 'from _pybricks_stubs import wait, StopWatch');
-
-    // pybricks/robotics.py
     pyodide.FS.writeFile('/pybricks/robotics.py', 'from _pybricks_stubs import DriveBase');
-
-    // Also make sure 'pybricks' top level works? Usually we import FROM pybricks.hubs etc.
 }
 
 self.onmessage = async (e) => {
@@ -280,16 +247,6 @@ self.onmessage = async (e) => {
     if (type === MSG_INIT) {
         try {
             console.log("Loading Pyodide...");
-            // Load Pyodide from CDN or local assets. 
-            // Since we installed 'pyodide' npm package, we might need to point to the artifacts.
-            // Vite handles this differently. Let's try standard CDN for simplicity and reliability if local fails,
-            // or use the one from node_modules if we configured vite to serve it.
-            // For now, let's assume the build process (vite-plugin-monaco-editor doesn't handle pyodide)
-            // We need to point indexURL to where pyodide files are.
-            // A common trick is to use a CDN or copy files to public.
-            // Let's try CDN for immediate success, or a robust relative path.
-            
-            // Actually, we can use the imported loadPyodide and let it default or point to a CDN.
             pyodide = await loadPyodide({
                 indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/"
             });
@@ -317,50 +274,62 @@ self.onmessage = async (e) => {
             // Write to file first
             pyodide.FS.writeFile('/main.py', code);
             
+            // Pass parameters via globals to avoid string injection risks
+            pyodide.globals.set("line_no", line);
+            pyodide.globals.set("col_no", column);
+            
             const pythonCode = `
 import jedi
 import sys
+
+# Ensure output is initialized
+output = []
 
 try:
     with open('/main.py', 'r') as f:
         source = f.read()
     
     script = jedi.Script(code=source, path='/main.py')
-    completions = script.complete(${line}, ${column})
-    result = []
+    completions = script.complete(line_no, col_no)
+    
+    result_list = []
     for c in completions:
-        kind = 0 # Property/Variable
-        if c.type == 'class': kind = 6 # Class
-        elif c.type == 'function': kind = 1 # Function
-        elif c.type == 'module': kind = 8 # Module
-        elif c.type == 'keyword': kind = 13 # Keyword
+        kind = 0
+        if c.type == 'class': kind = 6
+        elif c.type == 'function': kind = 1
+        elif c.type == 'module': kind = 8
+        elif c.type == 'keyword': kind = 13
         
-        result.append({
+        result_list.append({
             "label": c.name,
             "kind": kind, 
             "detail": c.description,
             "documentation": c.docstring()
         })
-    result
+    output = result_list
 except Exception as e:
-    str(e)
+    output = str(e)
 `;
-            const results = await pyodide.runPythonAsync(pythonCode);
-            // If results is a string, it's an error (from the except block)
+            await pyodide.runPythonAsync(pythonCode);
+            const results = pyodide.globals.get("output");
+            console.log("Jedi Results", results);
+            
             if (typeof results === 'string') {
                 console.error("Jedi Error:", results);
                 self.postMessage({ type: MSG_COMPLETE_FAIL, id, error: results });
-            } else {
-                // Ensure plain JS object
+            } else if (results && typeof results.toJs === 'function') {
                 const jsResults = results.toJs();
-                // If it's a Map (Pyodide default for dicts, but list of dicts should be Array of Map), 
-                // we need to convert maps to objects.
-                // But results is a list.
+                results.destroy(); // Free the PyProxy
+                
+                // Convert Map objects to plain Objects if necessary
                 const finalResults = jsResults.map(item => {
                     return (item instanceof Map) ? Object.fromEntries(item) : item;
                 });
                 
                 self.postMessage({ type: MSG_COMPLETE_RESULT, id, results: finalResults });
+            } else {
+                // If results is undefined or something unexpected
+                self.postMessage({ type: MSG_COMPLETE_RESULT, id, results: [] });
             }
         } catch (err) {
             console.error("Worker Exception:", err);
@@ -368,25 +337,10 @@ except Exception as e:
         }
     }
     else if (type === MSG_CHECK) {
-        // Syntax check
         if (!pyodide) return;
         try {
-            // We can use py_compile or just compile()
-            const checkCode = `
-import sys
-import traceback
-code_str = """${code.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"""
-try:
-    compile(code_str, 'main.py', 'exec')
-    None
-except SyntaxError as e:
-    { "line": e.lineno, "column": e.offset, "message": e.msg }
-except Exception as e:
-    { "line": 1, "column": 1, "message": str(e) }
-`;
-            // Again, risky string injection. Use file.
             pyodide.FS.writeFile('/main.py', code);
-             const checkCodeSafe = `
+            const checkCodeSafe = `
 import sys
 try:
     with open('/main.py', 'r') as f:
@@ -402,6 +356,7 @@ except Exception as e:
             let error = null;
             if (result) {
                 error = result.toJs({dict_converter: Object.fromEntries});
+                result.destroy();
             }
             self.postMessage({ type: MSG_CHECK_RESULT, id, error });
         } catch (err) {

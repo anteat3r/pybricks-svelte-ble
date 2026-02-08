@@ -78,13 +78,20 @@
                     const resolve = pendingCompletions.get(id);
                     
                     // Map Jedi results to Monaco
-                    const suggestions = results.map(r => ({
-                        label: r.label,
-                        kind: mapJediKindToMonaco(r.kind),
-                        insertText: r.label,
-                        detail: r.detail,
-                        documentation: r.documentation
-                    }));
+                    const suggestions = results.map(r => {
+                        // Sort dunder methods (__init__, etc.) to the bottom
+                        const isDunder = r.label.startsWith('__');
+                        const sortText = isDunder ? 'zz' + r.label : r.label;
+                        
+                        return {
+                            label: r.label,
+                            kind: mapJediKindToMonaco(r.kind),
+                            insertText: r.label,
+                            detail: r.detail,
+                            documentation: r.documentation,
+                            sortText: sortText
+                        };
+                    });
                     
                     resolve({ suggestions });
                     pendingCompletions.delete(id);
@@ -124,7 +131,13 @@
             tabSize: 4,
             insertSpaces: true,
             padding: { top: 10, bottom: 10 },
-            fontFamily: "'Consolas', 'Courier New', monospace"
+            fontFamily: "'Consolas', 'Courier New', monospace",
+            wordBasedSuggestions: 'off',
+            quickSuggestions: { other: true, comments: false, strings: false },
+            suggest: {
+                filterGraceful: true,
+                snippetsPreventQuickSuggestions: false,
+            }
         });
 
         editor.onDidChangeModelContent(() => {
